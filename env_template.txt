@@ -1,0 +1,13 @@
+# Hospital WhatsApp Chatbot Configuration
+# Copy this file to .env and fill in your values
+
+# Ollama Configuration (Local AI)
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=gemma3:1b-it-qat
+
+# WaSender API Configuration
+# Get your token from: https://wasenderapi.com/
+WASENDER_API_TOKEN=your_wasender_token_here
+
+# Optional: Change server port if needed (default: 5001)
+# PORT=5001 

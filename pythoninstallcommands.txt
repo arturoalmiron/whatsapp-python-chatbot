@@ -1,0 +1,8 @@
+python.exe -m pip install --upgrade pip
+if normalizer error:
+    pip cache purge
+    pip install 
+go to repo
+cd D:\GitHub\whatsappchatbot\whatsapp-python-chatbot
+D:
+pip install -r requirements.txt

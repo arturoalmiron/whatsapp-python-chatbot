@@ -3,8 +3,8 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-import google.generativeai as genai
 import json
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -18,14 +18,12 @@ if not os.path.exists(CONVERSATIONS_DIR):
     os.makedirs(CONVERSATIONS_DIR)
     logging.info(f"Created conversations directory at {CONVERSATIONS_DIR}")
 
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+# Ollama configuration (replace Gemini)
+OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'gemma3:1b-it-qat')
+
 WASENDER_API_TOKEN = os.getenv('WASENDER_API_TOKEN')
 WASENDER_API_URL = "https://wasenderapi.com/api/send-message"
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-else:
-    logging.error("GEMINI_API_KEY not found in environment variables. The application might not work correctly.")
 
 @app.errorhandler(Exception)
 def handle_global_exception(e):
@@ -35,9 +33,9 @@ def handle_global_exception(e):
 
 # --- Load Persona ---
 PERSONA_FILE_PATH = 'persona.json'
-PERSONA_DESCRIPTION = "You are a helpful assistant." # Default persona
-PERSONA_NAME = "Assistant"
-BASE_PROMPT = "You are a helpful and concise AI assistant replying in a WhatsApp chat. Do not use Markdown formatting. Keep your answers short, friendly, and easy to read. If your response is longer than 3 lines, split it into multiple messages using \n every 3 lines. Each \n means a new WhatsApp message. Avoid long paragraphs or unnecessary explanations."
+PERSONA_DESCRIPTION = "Eres un asistente médico virtual para un hospital. Tu trabajo es ayudar a los pacientes a reservar citas médicas de manera amigable y profesional en español." # Default persona for hospital
+PERSONA_NAME = "Asistente Médico"
+BASE_PROMPT = "Eres un asistente médico virtual amigable y profesional que ayuda a reservar citas en un hospital. Responde siempre en español de manera clara y concisa. Si el usuario no está siguiendo el proceso de reserva de cita, guíalo amablemente hacia ese objetivo."
 
 try:
     with open(PERSONA_FILE_PATH, 'r') as f:
@@ -48,11 +46,11 @@ try:
         PERSONA_NAME = persona_data.get('name', PERSONA_NAME)
     logging.info(f"Successfully loaded persona: {PERSONA_NAME}")
 except FileNotFoundError:
-    logging.warning(f"Persona file not found at {PERSONA_FILE_PATH}. Using default persona.")
+    logging.warning(f"Persona file not found at {PERSONA_FILE_PATH}. Using default hospital persona.")
 except json.JSONDecodeError:
-    logging.error(f"Error decoding JSON from {PERSONA_FILE_PATH}. Using default persona.")
+    logging.error(f"Error decoding JSON from {PERSONA_FILE_PATH}. Using default hospital persona.")
 except Exception as e:
-    logging.error(f"An unexpected error occurred while loading persona: {e}. Using default persona.")
+    logging.error(f"An unexpected error occurred while loading persona: {e}. Using default hospital persona.")
 # --- End Load Persona ---
 
 def load_conversation_history(user_id):
@@ -84,6 +82,7 @@ def save_conversation_history(user_id, history):
             json.dump(history, f, indent=2)
     except Exception as e:
         logging.error(f"Error saving conversation history to {file_path}: {e}")
+
 def split_message(text, max_lines=3, max_chars_per_line=100):
     """Split a long message into smaller chunks for better WhatsApp readability."""
     # First split by existing newlines
@@ -133,44 +132,54 @@ def split_message(text, max_lines=3, max_chars_per_line=100):
     
     return chunks
 
-def get_gemini_response(message_text, conversation_history=None):
-    """Generates a response from Gemini using the google-generativeai library, including conversation history."""
-    if not GEMINI_API_KEY:
-        logging.error("Gemini API key is not configured.")
-        return "Sorry, I'm having trouble connecting to my brain right now (API key issue)."
-
+def get_ollama_response(message_text, conversation_history=None):
+    """Generates a response from Ollama using the local API."""
     try:
-        # Using Gemini 2.0 Flash model with system instruction for persona
-        model_name = 'gemini-2.0-flash'
-        model = genai.GenerativeModel(model_name, system_instruction=PERSONA_DESCRIPTION)
+        # Prepare the prompt with persona and conversation history
+        system_prompt = PERSONA_DESCRIPTION
         
-        logging.info(f"Sending prompt to Gemini (system persona active): {message_text[:200]}...")
-
         if conversation_history:
-            # Use chat history if available
-            chat = model.start_chat(history=conversation_history)
-            response = chat.send_message(message_text)
+            # Format conversation history for Ollama
+            history_text = ""
+            for item in conversation_history[-6:]:  # Last 6 messages for context
+                role = "Usuario" if item['role'] == 'user' else "Asistente"
+                content = item['parts'][0] if item['parts'] else ""
+                history_text += f"{role}: {content}\n"
+            
+            full_prompt = f"{system_prompt}\n\nConversación anterior:\n{history_text}\nUsuario: {message_text}\nAsistente:"
         else:
-            # For first message with no history
-            response = model.generate_content(message_text)
+            full_prompt = f"{system_prompt}\n\nUsuario: {message_text}\nAsistente:"
 
-        # Extract the text from the response
-        if response and hasattr(response, 'text') and response.text:
-            return response.text.strip()
-        elif response and response.candidates:
-            # Fallback if .text is not directly available but candidates are
-            try:
-                return response.candidates[0].content.parts[0].text.strip()
-            except (IndexError, AttributeError, KeyError) as e:
-                logging.error(f"Error parsing Gemini response candidates: {e}. Response: {response}")
-                return "I received an unusual response structure from Gemini. Please try again."
+        # Call Ollama API
+        ollama_url = f"{OLLAMA_BASE_URL}/api/generate"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.7,
+                "max_tokens": 200
+            }
+        }
+        
+        logging.info(f"Sending prompt to Ollama ({OLLAMA_MODEL}): {message_text[:100]}...")
+        
+        response = requests.post(ollama_url, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        if 'response' in result:
+            return result['response'].strip()
         else:
-            logging.error(f"Gemini API (google-generativeai) returned an empty or unexpected response: {response}")
-            return "I received an empty or unexpected response from Gemini. Please try again."
-
+            logging.error(f"Unexpected Ollama response format: {result}")
+            return "Lo siento, hay un problema con mi sistema. ¿Puedes intentar de nuevo?"
+            
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error calling Ollama API: {e}")
+        return "No puedo conectarme a mi sistema de IA local. ¿Está Ollama funcionando?"
     except Exception as e:
-        logging.error(f"Error calling Gemini API with google-generativeai: {e}", exc_info=True)
-        return "I'm having trouble processing that request with my AI brain. Please try again later."
+        logging.error(f"Error processing Ollama response: {e}", exc_info=True)
+        return "Hubo un error procesando tu mensaje. Por favor intenta de nuevo."
 
 def send_whatsapp_message(recipient_number, message_content, message_type='text', media_url=None):
     """Sends a message via WaSenderAPI. Supports text and media messages."""
@@ -234,89 +243,106 @@ def send_whatsapp_message(recipient_number, message_content, message_type='text'
         logging.error(f"An unexpected error occurred while sending WhatsApp message: {e}")
         return False
 
+# Simulated storage for appointments and user states
+appointments = []
+user_states = {}
+
+# Spanish prompts for each step
+prompts = [
+    "¿Cuál es su nombre completo?",
+    "¿Cuál es la fecha y hora de la cita que desea reservar? (Ejemplo: 25/05/2025 14:30)",
+    "¿Con qué departamento o doctor desea la cita?",
+    "Por favor, proporcione su número de identificación (ID)."
+]
+
+def validate_appointment_date(date_string):
+    """Validate if the appointment date is in the future."""
+    try:
+        # Try different date formats
+        for fmt in ["%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%Y-%m-%d %H:%M"]:
+            try:
+                appointment_date = datetime.strptime(date_string, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return False, "Formato de fecha inválido. Use: DD/MM/YYYY HH:MM"
+        
+        # Check if date is in the future
+        if appointment_date <= datetime.now():
+            return False, "La fecha debe ser en el futuro."
+        
+        # Check if it's within business hours (8 AM to 6 PM)
+        if appointment_date.hour < 8 or appointment_date.hour >= 18:
+            return False, "Las citas solo están disponibles de 8:00 AM a 6:00 PM."
+        
+        # Check if it's a weekday
+        if appointment_date.weekday() >= 5:  # Saturday = 5, Sunday = 6
+            return False, "Las citas solo están disponibles de lunes a viernes."
+        
+        return True, "Fecha válida"
+    except Exception as e:
+        return False, "Error validando la fecha."
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Handles incoming WhatsApp messages via webhook."""
-    data = request.json
-    logging.info(f"Received webhook data (first 200 chars): {str(data)[:200]}")
-
     try:
-        if data.get('event') == 'messages.upsert' and data.get('data') and data['data'].get('messages'):
-            message_info = data['data']['messages']
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No JSON data received'}), 400
             
-            # Check if it's a message sent by the bot itself
-            if message_info.get('key', {}).get('fromMe'):
-                logging.info(f"Ignoring self-sent message: {message_info.get('key', {}).get('id')}")
-                return jsonify({'status': 'success', 'message': 'Self-sent message ignored'}), 200
+        user_id = data.get('from')  # WhatsApp number
+        message = data.get('body', '').strip()
 
-            sender_number = message_info.get('key', {}).get('remoteJid')
-            
-            incoming_message_text = None
-            message_type = 'unknown'
+        # Initialize state if new user
+        if user_id not in user_states:
+            user_states[user_id] = {'step': 0, 'data': {}}
+            return jsonify({'reply': prompts[0]})
 
-            # Extract message content based on message structure
-            if message_info.get('message'):
-                msg_content_obj = message_info['message']
-                if 'conversation' in msg_content_obj:
-                    incoming_message_text = msg_content_obj['conversation']
-                    message_type = 'text'
-                elif 'extendedTextMessage' in msg_content_obj and 'text' in msg_content_obj['extendedTextMessage']:
-                    incoming_message_text = msg_content_obj['extendedTextMessage']['text']
-                    message_type = 'text'
+        state = user_states[user_id]
+        step = state['step']
 
-            if message_info.get('messageStubType'):
-                stub_params = message_info.get('messageStubParameters', [])
-                logging.info(f"Received system message of type {message_info['messageStubType']} from {sender_number}. Stub params: {stub_params}")
-                return jsonify({'status': 'success', 'message': 'System message processed'}), 200
+        # Save the user's answer
+        if step == 0:
+            state['data']['nombre'] = message
+        elif step == 1:
+            # Validate date before saving
+            is_valid, error_message = validate_appointment_date(message)
+            if not is_valid:
+                return jsonify({'reply': f"{error_message} Por favor, intente de nuevo."})
+            state['data']['fecha_hora'] = message
+        elif step == 2:
+            state['data']['departamento_doctor'] = message
+        elif step == 3:
+            state['data']['id'] = message
+            # Placeholder for future insurance check
+            # When you have database access, check insurance here:
+            # has_insurance = check_insurance(state['data']['id'])
+            # if not has_insurance:
+            #     return jsonify({'reply': 'Lo siento, no se encontró seguro para este ID. ¿Desea continuar sin seguro?'})
 
-            if not sender_number:
-                logging.warning("Webhook received message without sender information.")
-                return jsonify({'status': 'error', 'message': 'Incomplete sender data'}), 400
-
-            # Sanitize sender_number to use as a filename
-            safe_sender_id = "".join(c if c.isalnum() else '_' for c in sender_number)
-
-            if message_type == 'text' and incoming_message_text:
-                logging.info(f"Processing text message from {sender_number} ({safe_sender_id}): {incoming_message_text}")
-                
-                # Load conversation history
-                conversation_history = load_conversation_history(safe_sender_id)
-                
-                # Get Gemini's reply, passing the history
-                gemini_reply = get_gemini_response(incoming_message_text, conversation_history)
-                
-                if gemini_reply:
-                    # Split the response into chunks and send them sequentially
-                    message_chunks = split_message(gemini_reply)
-                    for chunk in message_chunks:
-                        if not send_whatsapp_message(sender_number, chunk, message_type='text'):
-                            logging.error(f"Failed to send message chunk to {sender_number}")
-                            break
-                        # Delay between messages
-                        import random
-                        import time
-                        if i < len(message_chunks) - 1:
-                            delay = random.uniform(0.55, 1.5)
-                            time.sleep(delay)
-                    # Save the new exchange to history
-                    # Ensure history format is compatible with genai: list of {'role': 'user'/'model', 'parts': ['text']}
-                    conversation_history.append({'role': 'user', 'parts': [incoming_message_text]})
-                    conversation_history.append({'role': 'model', 'parts': [gemini_reply]})
-                    save_conversation_history(safe_sender_id, conversation_history)
-            elif incoming_message_text:
-                logging.info(f"Received '{message_type}' message from {sender_number}. No text content. Full data: {message_info}")
-            elif message_type != 'unknown':
-                 logging.info(f"Received '{message_type}' message from {sender_number}. No text content. Full data: {message_info}")
-            else:
-                logging.warning(f"Received unhandled or incomplete message from {sender_number}. Data: {message_info}")
-        elif data.get('event'):
-            logging.info(f"Received event '{data.get('event')}' which is not 'messages.upsert'. Data: {str(data)[:200]}")
-
-        return jsonify({'status': 'success'}), 200
+        # Move to next step or finish
+        if step < 3:
+            state['step'] += 1
+            return jsonify({'reply': prompts[state['step']]})
+        else:
+            # Save appointment
+            appointments.append(state['data'])
+            confirmation = (
+                f"¡Gracias! Su cita ha sido reservada:\n"
+                f"Nombre: {state['data']['nombre']}\n"
+                f"Fecha y hora: {state['data']['fecha_hora']}\n"
+                f"Departamento/Doctor: {state['data']['departamento_doctor']}\n"
+                f"ID: {state['data']['id']}\n"
+                "Si necesita cambiar o cancelar la cita, por favor responda a este mensaje."
+            )
+            # Reset user state
+            del user_states[user_id]
+            return jsonify({'reply': confirmation})
     except Exception as e:
-        logging.error(f"Error processing webhook: {e}")
-        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
+        logging.error(f"Error in webhook: {e}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
-    # For development with webhook testing via ngrok
-    app.run(debug=True, port=5001, host='0.0.0.0')
+    port = int(os.environ.get('PORT', 5001))
+    app.run(host='0.0.0.0', port=port)
