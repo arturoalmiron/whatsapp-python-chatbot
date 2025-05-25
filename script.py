@@ -5,6 +5,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import json
 from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
 load_dotenv()
 
@@ -247,6 +248,135 @@ def send_whatsapp_message(recipient_number, message_content, message_type='text'
 appointments = []
 user_states = {}
 
+# Rate limiting configuration
+RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', 5))  # Per user
+RATE_LIMIT_PER_HOUR = int(os.getenv('RATE_LIMIT_PER_HOUR', 30))   # Per user
+RATE_LIMIT_CLEANUP_INTERVAL = 3600  # Clean old data every hour
+
+# Global rate limiting (protects server from being overwhelmed)
+GLOBAL_RATE_LIMIT_PER_HOUR = int(os.getenv('GLOBAL_RATE_LIMIT_PER_HOUR', 1000))  # Total requests per hour across all users
+GLOBAL_RATE_LIMIT_PER_MINUTE = int(os.getenv('GLOBAL_RATE_LIMIT_PER_MINUTE', 100))  # Total requests per minute across all users
+
+# Rate limiting storage
+# Structure: {user_id: {'minute': deque(timestamps), 'hour': deque(timestamps), 'last_cleanup': timestamp}}
+rate_limit_data = defaultdict(lambda: {'minute': deque(), 'hour': deque(), 'last_cleanup': datetime.now()})
+
+# Global rate limiting storage
+global_rate_limit_data = {'minute': deque(), 'hour': deque()}
+
+def cleanup_old_rate_limit_data():
+    """Remove old rate limit entries to prevent memory buildup."""
+    current_time = datetime.now()
+    users_to_remove = []
+    
+    # Clean global rate limit data
+    one_minute_ago = current_time - timedelta(minutes=1)
+    one_hour_ago = current_time - timedelta(hours=1)
+    
+    while global_rate_limit_data['minute'] and global_rate_limit_data['minute'][0] < one_minute_ago:
+        global_rate_limit_data['minute'].popleft()
+    
+    while global_rate_limit_data['hour'] and global_rate_limit_data['hour'][0] < one_hour_ago:
+        global_rate_limit_data['hour'].popleft()
+    
+    # Clean per-user rate limit data
+    for user_id, data in rate_limit_data.items():
+        # Clean minute queue (keep only last minute)
+        while data['minute'] and data['minute'][0] < one_minute_ago:
+            data['minute'].popleft()
+        
+        # Clean hour queue (keep only last hour)
+        while data['hour'] and data['hour'][0] < one_hour_ago:
+            data['hour'].popleft()
+        
+        # Mark user for removal if no recent activity
+        if not data['minute'] and not data['hour'] and data['last_cleanup'] < one_hour_ago:
+            users_to_remove.append(user_id)
+    
+    # Remove inactive users
+    for user_id in users_to_remove:
+        del rate_limit_data[user_id]
+    
+    logging.info(f"Rate limit cleanup: removed {len(users_to_remove)} inactive users, global data cleaned")
+
+def check_rate_limit(user_id):
+    """
+    Check if user has exceeded rate limits (both per-user and global).
+    Returns (is_allowed, error_message)
+    """
+    current_time = datetime.now()
+    user_data = rate_limit_data[user_id]
+    
+    # Periodic cleanup
+    if current_time - user_data['last_cleanup'] > timedelta(seconds=RATE_LIMIT_CLEANUP_INTERVAL):
+        cleanup_old_rate_limit_data()
+        user_data['last_cleanup'] = current_time
+    
+    # Check global rate limits first (protects server)
+    one_minute_ago = current_time - timedelta(minutes=1)
+    one_hour_ago = current_time - timedelta(hours=1)
+    
+    # Clean and check global minute limit
+    while global_rate_limit_data['minute'] and global_rate_limit_data['minute'][0] < one_minute_ago:
+        global_rate_limit_data['minute'].popleft()
+    
+    if len(global_rate_limit_data['minute']) >= GLOBAL_RATE_LIMIT_PER_MINUTE:
+        logging.warning(f"Global rate limit exceeded (per minute): {len(global_rate_limit_data['minute'])} requests")
+        return False, f"El sistema está muy ocupado en este momento. Por favor intente de nuevo en unos minutos. (Límite global: {GLOBAL_RATE_LIMIT_PER_MINUTE} solicitudes por minuto)"
+    
+    # Clean and check global hour limit
+    while global_rate_limit_data['hour'] and global_rate_limit_data['hour'][0] < one_hour_ago:
+        global_rate_limit_data['hour'].popleft()
+    
+    if len(global_rate_limit_data['hour']) >= GLOBAL_RATE_LIMIT_PER_HOUR:
+        logging.warning(f"Global rate limit exceeded (per hour): {len(global_rate_limit_data['hour'])} requests")
+        return False, f"El sistema ha alcanzado su capacidad máxima por hora. Por favor intente más tarde. (Límite global: {GLOBAL_RATE_LIMIT_PER_HOUR} solicitudes por hora)"
+    
+    # Check per-user rate limits
+    while user_data['minute'] and user_data['minute'][0] < one_minute_ago:
+        user_data['minute'].popleft()
+    
+    if len(user_data['minute']) >= RATE_LIMIT_PER_MINUTE:
+        logging.warning(f"User rate limit exceeded (per minute) for user {user_id}: {len(user_data['minute'])} messages")
+        return False, f"Ha enviado demasiados mensajes muy rápido. Por favor espere un momento antes de continuar. (Límite personal: {RATE_LIMIT_PER_MINUTE} mensajes por minuto)"
+    
+    while user_data['hour'] and user_data['hour'][0] < one_hour_ago:
+        user_data['hour'].popleft()
+    
+    if len(user_data['hour']) >= RATE_LIMIT_PER_HOUR:
+        logging.warning(f"User rate limit exceeded (per hour) for user {user_id}: {len(user_data['hour'])} messages")
+        return False, f"Ha alcanzado su límite de mensajes por hora. Por favor intente de nuevo más tarde. (Límite personal: {RATE_LIMIT_PER_HOUR} mensajes por hora)"
+    
+    # Record this request (both user and global)
+    user_data['minute'].append(current_time)
+    user_data['hour'].append(current_time)
+    global_rate_limit_data['minute'].append(current_time)
+    global_rate_limit_data['hour'].append(current_time)
+    
+    return True, ""
+
+def get_rate_limit_status(user_id):
+    """Get current rate limit status for a user (for debugging/monitoring)."""
+    if user_id not in rate_limit_data:
+        return {"minute_count": 0, "hour_count": 0}
+    
+    current_time = datetime.now()
+    user_data = rate_limit_data[user_id]
+    
+    # Count recent messages
+    one_minute_ago = current_time - timedelta(minutes=1)
+    one_hour_ago = current_time - timedelta(hours=1)
+    
+    minute_count = sum(1 for ts in user_data['minute'] if ts >= one_minute_ago)
+    hour_count = sum(1 for ts in user_data['hour'] if ts >= one_hour_ago)
+    
+    return {
+        "minute_count": minute_count,
+        "hour_count": hour_count,
+        "minute_limit": RATE_LIMIT_PER_MINUTE,
+        "hour_limit": RATE_LIMIT_PER_HOUR
+    }
+
 # Spanish prompts for each step
 prompts = [
     "¿Cuál es su nombre completo?",
@@ -293,6 +423,12 @@ def webhook():
             
         user_id = data.get('from')  # WhatsApp number
         message = data.get('body', '').strip()
+
+        # Check rate limits first
+        is_allowed, rate_limit_error = check_rate_limit(user_id)
+        if not is_allowed:
+            logging.warning(f"Rate limit exceeded for user {user_id}. Message: {message[:50]}")
+            return jsonify({'reply': rate_limit_error})
 
         # Initialize state if new user
         if user_id not in user_states:
@@ -342,6 +478,72 @@ def webhook():
     except Exception as e:
         logging.error(f"Error in webhook: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/admin/status', methods=['GET'])
+def admin_status():
+    """Admin endpoint to check system status and rate limits."""
+    try:
+        current_time = datetime.now()
+        
+        # Get rate limit statistics
+        active_users = len(rate_limit_data)
+        total_appointments = len(appointments)
+        active_conversations = len(user_states)
+        
+        # Calculate global usage
+        one_minute_ago = current_time - timedelta(minutes=1)
+        one_hour_ago = current_time - timedelta(hours=1)
+        
+        global_minute_count = sum(1 for ts in global_rate_limit_data['minute'] if ts >= one_minute_ago)
+        global_hour_count = sum(1 for ts in global_rate_limit_data['hour'] if ts >= one_hour_ago)
+        
+        # Calculate rate limit usage
+        rate_limit_stats = {}
+        for user_id in list(rate_limit_data.keys())[:10]:  # Show top 10 for brevity
+            stats = get_rate_limit_status(user_id)
+            if stats['minute_count'] > 0 or stats['hour_count'] > 0:
+                rate_limit_stats[user_id] = stats
+        
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': current_time.isoformat(),
+            'statistics': {
+                'active_users_with_rate_data': active_users,
+                'total_appointments': total_appointments,
+                'active_conversations': active_conversations,
+                'global_usage': {
+                    'requests_last_minute': global_minute_count,
+                    'requests_last_hour': global_hour_count,
+                    'minute_limit': GLOBAL_RATE_LIMIT_PER_MINUTE,
+                    'hour_limit': GLOBAL_RATE_LIMIT_PER_HOUR,
+                    'minute_usage_percent': round((global_minute_count / GLOBAL_RATE_LIMIT_PER_MINUTE) * 100, 1),
+                    'hour_usage_percent': round((global_hour_count / GLOBAL_RATE_LIMIT_PER_HOUR) * 100, 1)
+                },
+                'per_user_limits': {
+                    'per_minute': RATE_LIMIT_PER_MINUTE,
+                    'per_hour': RATE_LIMIT_PER_HOUR
+                }
+            },
+            'recent_rate_limit_usage': rate_limit_stats,
+            'ollama_status': 'configured' if os.getenv('OLLAMA_BASE_URL') else 'not_configured'
+        })
+    except Exception as e:
+        logging.error(f"Error in admin status: {e}")
+        return jsonify({'error': 'Unable to get status'}), 500
+
+@app.route('/admin/rate-limits/<user_id>', methods=['GET'])
+def admin_user_rate_limit(user_id):
+    """Get rate limit status for a specific user."""
+    try:
+        stats = get_rate_limit_status(user_id)
+        return jsonify({
+            'user_id': user_id,
+            'rate_limit_status': stats,
+            'has_active_conversation': user_id in user_states
+        })
+    except Exception as e:
+        logging.error(f"Error getting rate limit for user {user_id}: {e}")
+        return jsonify({'error': 'Unable to get user rate limit'}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))

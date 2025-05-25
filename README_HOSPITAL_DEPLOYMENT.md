@@ -37,6 +37,14 @@ OLLAMA_MODEL=gemma3:1b-it-qat
 
 # WaSender API (get from wasenderapi.com)
 WASENDER_API_TOKEN=your_token_here
+
+# Per-user limits
+RATE_LIMIT_PER_MINUTE=5
+RATE_LIMIT_PER_HOUR=30
+
+# Global limits (adjust based on server power)
+GLOBAL_RATE_LIMIT_PER_MINUTE=100
+GLOBAL_RATE_LIMIT_PER_HOUR=1000
 ```
 
 ### 4. Get WhatsApp API Token
@@ -70,6 +78,63 @@ Expected response: `{"reply":"¿Cuál es su nombre completo?"}`
 - ✅ Date validation (business hours, weekdays only)
 - ✅ Local AI (no external API costs)
 - ✅ Insurance checking (ready for database integration)
+- ✅ Rate limiting (5 messages/minute, 30 messages/hour per user)
+- ✅ Admin monitoring endpoints
+- ✅ Automatic cleanup of old data
+
+## Rate Limiting & Security
+The system includes built-in protection against abuse with **two-level rate limiting**:
+
+### Per-User Limits (Individual Protection)
+- **5 messages per minute** per WhatsApp number
+- **30 messages per hour** per WhatsApp number
+- Prevents individual users from spamming the system
+
+### Global Limits (Server Protection)
+- **100 requests per minute** across all users
+- **1000 requests per hour** across all users
+- Protects server from being overwhelmed by too many simultaneous users
+
+### Additional Features
+- Automatic cleanup of old rate limit data
+- Spanish error messages for rate limit violations
+- Admin endpoints for monitoring usage
+- **Easy configuration** via environment variables
+
+### Configuring Rate Limits
+Add to your `.env` file to customize limits based on your server capacity:
+```env
+# Per-user limits
+RATE_LIMIT_PER_MINUTE=5
+RATE_LIMIT_PER_HOUR=30
+
+# Global limits (adjust based on server power)
+GLOBAL_RATE_LIMIT_PER_MINUTE=100
+GLOBAL_RATE_LIMIT_PER_HOUR=1000
+```
+
+### Admin Endpoints
+- `GET /admin/status` - System health, global usage statistics, and server load
+- `GET /admin/rate-limits/{user_id}` - Rate limit status for specific user
+
+Example admin status check:
+```bash
+curl http://localhost:5001/admin/status
+```
+
+**Global usage example response:**
+```json
+{
+  "global_usage": {
+    "requests_last_minute": 15,
+    "requests_last_hour": 245,
+    "minute_limit": 100,
+    "hour_limit": 1000,
+    "minute_usage_percent": 15.0,
+    "hour_usage_percent": 24.5
+  }
+}
+```
 
 ## Troubleshooting
 - **Port 5001 blocked**: Change port in script.py

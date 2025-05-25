@@ -10,4 +10,14 @@ OLLAMA_MODEL=gemma3:1b-it-qat
 WASENDER_API_TOKEN=your_wasender_token_here
 
 # Optional: Change server port if needed (default: 5001)
-# PORT=5001 
+# PORT=5001
+
+# Rate Limiting Configuration (optional - these are the defaults)
+# Per-user limits (prevents individual user abuse)
+# RATE_LIMIT_PER_MINUTE=5
+# RATE_LIMIT_PER_HOUR=30
+
+# Global limits (protects server from being overwhelmed)
+# Adjust based on your server's capacity
+# GLOBAL_RATE_LIMIT_PER_MINUTE=100
+# GLOBAL_RATE_LIMIT_PER_HOUR=1000 
